@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { logger } from '@/utils/logger.js';
 import { AgentRegistry } from '@/agents/registry.js';
 import { getSessionPath, getSessionMetricsPath, getSessionConversationPath } from '@/agents/core/session/session-config.js';
+import { SESSION_ORIGIN, SESSION_ORIGIN_ENV_KEY } from '@/agents/core/session/types.js';
 import type { BaseHookEvent, HookTransformer, MCPConfigSummary, ExtensionsScanSummary } from '@/agents/core/types.js';
 import type { ProcessingContext } from '@/agents/core/session/BaseProcessor.js';
 
@@ -634,10 +635,16 @@ async function routeHookEvent(event: BaseHookEvent, rawInput: string, sessionId:
       event.transcript_path &&
       (normalizedEventName === 'UserPromptSubmit' || normalizedEventName === 'Stop')
     ) {
-      const { appendTranscriptMarker } = await import(
+      const { appendTranscriptMarker, isExternalOrigin } = await import(
         '../../agents/core/session/session-origin-audit.js'
       );
-      appendTranscriptMarker(event.transcript_path, sessionId, agentName);
+      const { SessionStore } = await import('../../agents/core/session/SessionStore.js');
+      const session = await new SessionStore().loadSession(sessionId);
+      // Never (re-)stamp a transcript that's flagged external-resume — doing so would
+      // re-adopt it into the local analytics ownership index (native-loader.ts).
+      if (!isExternalOrigin(session)) {
+        appendTranscriptMarker(event.transcript_path, sessionId, agentName);
+      }
     }
 
     const duration = Date.now() - startTime;
@@ -714,6 +721,12 @@ async function createSessionRecord(event: SessionStartEvent, sessionId: string, 
     // process with a fresh CODEMIE_SESSION_ID, so it never reaches this branch.)
     const existing = await sessionStore.loadSession(sessionId);
     if (existing && existing.status === 'active' && existing.endTime === undefined) {
+      const {
+        appendTranscriptMarker: writeMarker,
+        appendAuditEvent: writeAudit,
+        isExternalOrigin,
+      } = await import('../../agents/core/session/session-origin-audit.js');
+
       existing.status = 'active';
       if (gitBranch) existing.gitBranch = gitBranch;
       if (remoteRepository) existing.repository = remoteRepository;
@@ -723,11 +736,13 @@ async function createSessionRecord(event: SessionStartEvent, sessionId: string, 
         ...(event.session_id && { agentSessionId: event.session_id }),
         ...(event.transcript_path && { agentSessionFile: event.transcript_path }),
       };
+      // Preserve an already-set origin; only derive from env for pre-existing records that
+      // predate this field. An established origin must never flip on re-entry.
+      if (!existing.origin && getConfigValue(SESSION_ORIGIN_ENV_KEY, config) === SESSION_ORIGIN.EXTERNAL_RESUME) {
+        existing.origin = SESSION_ORIGIN.EXTERNAL_RESUME;
+      }
       await sessionStore.saveSession(existing);
-      const { appendTranscriptMarker: writeMarker, appendAuditEvent: writeAudit } = await import(
-        '../../agents/core/session/session-origin-audit.js'
-      );
-      if (event.transcript_path) {
+      if (event.transcript_path && !isExternalOrigin(existing)) {
         writeMarker(event.transcript_path, sessionId, agentName);
         writeAudit('transcript_marker_written', {
           codemieSessionId: sessionId,
@@ -742,6 +757,14 @@ async function createSessionRecord(event: SessionStartEvent, sessionId: string, 
       return;
     }
 
+    const { appendTranscriptMarker, appendAuditEvent, isExternalOrigin } = await import(
+      '../../agents/core/session/session-origin-audit.js'
+    );
+    const origin =
+      getConfigValue(SESSION_ORIGIN_ENV_KEY, config) === SESSION_ORIGIN.EXTERNAL_RESUME
+        ? SESSION_ORIGIN.EXTERNAL_RESUME
+        : undefined;
+
     // Create session record with correlation already matched
     const session = {
       sessionId,
@@ -754,6 +777,7 @@ async function createSessionRecord(event: SessionStartEvent, sessionId: string, 
       ...(gitBranch && { gitBranch }),
       status: 'active' as const,
       activeDurationMs: 0, // Initialize active duration tracking
+      ...(origin && { origin }),
       correlation: {
         status: 'matched' as const,
         agentSessionId: event.session_id,
@@ -765,10 +789,9 @@ async function createSessionRecord(event: SessionStartEvent, sessionId: string, 
     // Save session
     await sessionStore.saveSession(session);
 
-    const { appendTranscriptMarker, appendAuditEvent } = await import(
-      '../../agents/core/session/session-origin-audit.js'
-    );
-    if (session.correlation.agentSessionFile) {
+    // Never stamp a transcript that's flagged external-resume — doing so would re-adopt it
+    // into the local analytics ownership index (native-loader.ts) and undo the exclusion.
+    if (session.correlation.agentSessionFile && !isExternalOrigin(session)) {
       appendTranscriptMarker(
         session.correlation.agentSessionFile,
         sessionId,
@@ -815,6 +838,16 @@ async function sendSessionStartMetrics(event: SessionStartEvent, sessionId: stri
 
     if (!sessionId || !agentName || !ssoUrl || !apiUrl) {
       logger.debug('[hook:SessionStart] Missing required config for metrics');
+      return;
+    }
+
+    // Session record is created (with origin persisted) immediately before this is called —
+    // see handleSessionStart. Never upload lifecycle metrics for a confirmed external resume.
+    const { isExternalOrigin } = await import('../../agents/core/session/session-origin-audit.js');
+    const { SessionStore } = await import('../../agents/core/session/SessionStore.js');
+    const session = await new SessionStore().loadSession(sessionId);
+    if (isExternalOrigin(session)) {
+      logger.debug('[hook:SessionStart] Skipping start metrics for external-resume session');
       return;
     }
 
@@ -1097,6 +1130,12 @@ async function sendSessionEndMetrics(event: SessionEndEvent, sessionId: string, 
 
     if (!session) {
       logger.warn(`[hook:SessionEnd] Session not found for metrics: ${sessionId}`);
+      return;
+    }
+
+    const { isExternalOrigin } = await import('../../agents/core/session/session-origin-audit.js');
+    if (isExternalOrigin(session)) {
+      logger.debug('[hook:SessionEnd] Skipping end metrics for external-resume session');
       return;
     }
 
