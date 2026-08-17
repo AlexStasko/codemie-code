@@ -614,7 +614,7 @@ in the bottom-left and persists your choice (defaults to dark).
 
 **Cost estimation** is computed at report time: for each session the native agent log
 (Claude, Claude Desktop, Gemini, …) is re-parsed for token usage and priced against
-`src/cli/commands/analytics/cost/pricing.json`. Claude Desktop (the native Anthropic
+`src/utils/pricing.json`. Claude Desktop (the native Anthropic
 subscription app, local-agent mode) is included — its `audit.jsonl` carries an
 authoritative per-model usage rollup that is matched against the pricing table. The
 Cost view shows a **Coverage by agent** table (sessions priced / native-log found per
@@ -635,7 +635,7 @@ counting each response once — without this the figure inflates ~2–3×. On a 
 don't pay per token, so the figure is labeled **"Est. cost (API-equivalent)"** — the metered
 API value of your usage, not dollars billed.
 
-> **Refreshing prices:** `cost/pricing.json` is a vendored table (`{ "<model>":
+> **Refreshing prices:** `src/utils/pricing.json` is a vendored table (`{ "<model>":
 > { input, output, cacheRead, cacheWrite } }`, USD per 1M tokens). When new models ship,
 > add or update entries there — unpriced models are surfaced in the Cost view's banner.
 
