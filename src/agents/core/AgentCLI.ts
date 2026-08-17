@@ -663,10 +663,14 @@ export class AgentCLI {
     const { createInterface } = await import('node:readline');
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
+    const wrapperCommand = this.adapter.name.startsWith('codemie-')
+      ? this.adapter.name
+      : `codemie-${this.adapter.name}`;
+
     console.log(chalk.yellow(`\n⚠  Warning: Session ${sessionId} was not created through CodeMie.`));
     console.log(chalk.white('If you continue:'));
-    console.log(chalk.white('  • Token usage and API metrics WILL be tracked via the CodeMie proxy.'));
-    console.log(chalk.white('  • Conversation transcript will NOT be synced to your CodeMie account history.\n'));
+    console.log(chalk.white('  • This session will NOT be tracked as a CodeMie session — no CodeMie session metrics, no transcript sync, and it will not appear in CodeMie Analytics.'));
+    console.log(chalk.white(`  • API calls still route through the CodeMie proxy while using ${wrapperCommand}, so usage will still be logged/billed there.\n`));
     console.log(chalk.dim(
       fallbackResumeCommand
         ? `To resume without any CodeMie tracking, use: ${fallbackResumeCommand}\n`
