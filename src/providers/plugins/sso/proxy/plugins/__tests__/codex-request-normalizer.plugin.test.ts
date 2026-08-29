@@ -163,6 +163,43 @@ describe('CodexRequestNormalizerPlugin fallback without a pinned model', () => {
     expect(bodyOf(context).model).toBe('gpt-5.6-luna-2026-07-09');
   });
 
+  it('resolves an undated pinned profile model to its dated deployment', async () => {
+    // config.model carries the profile's undated picker name (e.g. from
+    // `codemie proxy connect --codex-desktop`); the fallback must resolve it to
+    // the dated deployment rather than dropping to the recency default.
+    const { CodexRequestNormalizerPlugin } = await import('../codex-request-normalizer.plugin.js');
+    const plugin = new CodexRequestNormalizerPlugin();
+    const interceptor = await plugin.createInterceptor(
+      makePluginContext({ config: { clientType: 'codex-desktop', model: 'gpt-5.6-sol' } })
+    );
+    (interceptor as unknown as { setAvailableModelsForTest(m: string[]): void })
+      .setAvailableModelsForTest(AVAILABLE);
+
+    const context = makeProxyContext({ model: 'gpt-4o-does-not-exist', input: 'hi' });
+    await interceptor.onRequest!(context);
+
+    expect(bodyOf(context).model).toBe('gpt-5.6-sol-2026-07-09');
+  });
+
+  it('ignores an Anthropic pinned profile model and falls back to the codex default', async () => {
+    // The active profile is frequently an Anthropic/Sonnet profile
+    // (config.model = 'claude-sonnet-5'). A Claude name is never a Codex
+    // deployment, so the fallback must drop to the recency default rather than
+    // substitute a Claude slug into a Codex Responses request.
+    const { CodexRequestNormalizerPlugin } = await import('../codex-request-normalizer.plugin.js');
+    const plugin = new CodexRequestNormalizerPlugin();
+    const interceptor = await plugin.createInterceptor(
+      makePluginContext({ config: { clientType: 'codex-desktop', model: 'claude-sonnet-5' } })
+    );
+    (interceptor as unknown as { setAvailableModelsForTest(m: string[]): void })
+      .setAvailableModelsForTest(AVAILABLE);
+
+    const context = makeProxyContext({ model: 'gpt-4o-does-not-exist', input: 'hi' });
+    await interceptor.onRequest!(context);
+
+    expect(bodyOf(context).model).toBe('gpt-5.6-luna-2026-07-09');
+  });
+
   it('prefers an explicitly pinned model over the newest when one is configured', async () => {
     const { CodexRequestNormalizerPlugin } = await import('../codex-request-normalizer.plugin.js');
     const plugin = new CodexRequestNormalizerPlugin();
