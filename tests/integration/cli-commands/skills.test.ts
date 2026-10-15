@@ -51,6 +51,7 @@ beforeAll(() => {
       '    DISABLE_TELEMETRY: process.env.DISABLE_TELEMETRY,',
       '    CI: process.env.CI,',
       '    NODE_OPTIONS: process.env.NODE_OPTIONS,',
+      '    CODEMIE_CAPTURE_SKILLS_SH_INSTALL_TELEMETRY: process.env.CODEMIE_CAPTURE_SKILLS_SH_INSTALL_TELEMETRY,',
       '  },',
       '}) + "\\n");',
       'process.exit(Number(process.env.STUB_EXIT_CODE ?? 0));',
@@ -193,12 +194,23 @@ describe.runIf(HAS_LOCAL_SSO)('codemie skills (authenticated upstream spawn)', (
     expect(invocation.argv).toContain('bar');
   });
 
-  it('add: injects DO_NOT_TRACK / DISABLE_TELEMETRY / CI / NODE_OPTIONS shim', () => {
+  it('add: reopens the telemetry gate for local capture behind the egress guard shim', () => {
     runCLI(['add', 'owner/repo', '-a', 'claude-code', '-y']);
+    const [invocation] = readInvocations();
+    // Cleared (not '1') so upstream emits the install payload; the shim captures it
+    // locally and blocks the request from leaving the machine.
+    expect(invocation.env.DO_NOT_TRACK).toBe('');
+    expect(invocation.env.DISABLE_TELEMETRY).toBe('');
+    expect(invocation.env.CODEMIE_CAPTURE_SKILLS_SH_INSTALL_TELEMETRY).toBe('1');
+    expect(invocation.env.CI).toBe('1');
+    expect(invocation.env.NODE_OPTIONS).toMatch(/--require\s+"[^"]+skills-sh-egress-guard\.cjs"/);
+  });
+
+  it('list: keeps upstream telemetry disabled and injects the egress guard shim', () => {
+    runCLI(['list', '--global']);
     const [invocation] = readInvocations();
     expect(invocation.env.DO_NOT_TRACK).toBe('1');
     expect(invocation.env.DISABLE_TELEMETRY).toBe('1');
-    expect(invocation.env.CI).toBe('1');
     expect(invocation.env.NODE_OPTIONS).toMatch(/--require\s+"[^"]+skills-sh-egress-guard\.cjs"/);
   });
 
