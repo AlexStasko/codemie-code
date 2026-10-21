@@ -11,7 +11,10 @@ const resolveHookCredentialsMock = vi.fn();
 const resolveIdentityMock = vi.fn();
 const getActiveProfileNameMock = vi.fn();
 const configLoadMock = vi.fn();
+const hasLocalConfigMock = vi.fn();
 const getCurrentCliVersionMock = vi.fn();
+const readPinnedProjectNameMock = vi.fn();
+const pinProjectNameMock = vi.fn();
 
 vi.mock('../hook-credentials.js', () => ({ resolveHookCredentials: resolveHookCredentialsMock }));
 vi.mock('../identity-resolver.js', async () => ({
@@ -19,9 +22,13 @@ vi.mock('../identity-resolver.js', async () => ({
   resolveIdentity: resolveIdentityMock,
 }));
 vi.mock('@/utils/config.js', () => ({
-  ConfigLoader: { getActiveProfileName: getActiveProfileNameMock, load: configLoadMock },
+  ConfigLoader: { getActiveProfileName: getActiveProfileNameMock, load: configLoadMock, hasLocalConfig: hasLocalConfigMock },
 }));
 vi.mock('@/utils/cli-updater.js', () => ({ getCurrentCliVersion: getCurrentCliVersionMock }));
+vi.mock('../session-project-pin.js', () => ({
+  readPinnedProjectName: readPinnedProjectNameMock,
+  pinProjectName: pinProjectNameMock,
+}));
 vi.mock('@/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
@@ -33,6 +40,7 @@ type Context = import('../OtlpAgentAdapter.js').OtlpHookContext;
 interface FakeInput {
   cwd: string;
   prompt?: string;
+  sessionId?: string;
   payload: Record<string, unknown>[];
   block?: boolean;
 }
@@ -46,7 +54,7 @@ class FakeAdapter extends OtlpAgentAdapter<FakeInput> {
     return typeof parsed.cwd === 'string' ? (parsed as FakeInput) : null;
   }
   protected extractHookContext(input: FakeInput): Context {
-    return { cwd: input.cwd, prompt: input.prompt };
+    return { cwd: input.cwd, prompt: input.prompt, sessionId: input.sessionId };
   }
   protected async isTracked(): Promise<boolean> {
     return this.tracked;
@@ -96,11 +104,17 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
     getActiveProfileNameMock.mockResolvedValue('work');
     configLoadMock.mockResolvedValue({ codeMieProject: 'proj-1' });
     getCurrentCliVersionMock.mockResolvedValue('1.2.3');
+    readPinnedProjectNameMock.mockResolvedValue(undefined);
+    pinProjectNameMock.mockImplementation(async (_sessionId: string, project: string) => project);
     delete process.env['SDLC_ANALYTICS_STORY_ID'];
+    delete process.env['CODEMIE_PROJECT'];
+    delete process.env['CLAUDE_PROJECT_DIR'];
   });
 
   afterEach(() => {
     delete process.env['SDLC_ANALYTICS_STORY_ID'];
+    delete process.env['CODEMIE_PROJECT'];
+    delete process.env['CLAUDE_PROJECT_DIR'];
     vi.restoreAllMocks();
   });
 
@@ -222,7 +236,81 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
       expect(configLoadMock).toHaveBeenCalledWith('/repo', undefined);
     });
 
-    it('still forwards with empty context fields when resolution fails', async () => {
+    it('prefers CODEMIE_PROJECT over the resolved config, without even loading it', async () => {
+      process.env['CODEMIE_PROJECT'] = 'env-project';
+      await run();
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'env-project' });
+      expect(configLoadMock).not.toHaveBeenCalled();
+    });
+
+    it('ignores a blank CODEMIE_PROJECT and falls back to the resolved config', async () => {
+      process.env['CODEMIE_PROJECT'] = '   ';
+      await run();
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'proj-1' });
+    });
+
+    it('ignores a blank CLAUDE_PROJECT_DIR and resolves from the hook cwd instead', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '   ';
+      await run();
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/repo');
+      expect(hasLocalConfigMock).not.toHaveBeenCalled();
+    });
+
+    it('resolves the config from CLAUDE_PROJECT_DIR, not the hook cwd, when it is set', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '/workspace/project';
+      hasLocalConfigMock.mockResolvedValue(true);
+      await run({ cwd: '/workspace/project/src' });
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/workspace/project');
+      expect(configLoadMock).toHaveBeenCalledWith('/workspace/project', { name: 'work' });
+    });
+
+    it('walks up from CLAUDE_PROJECT_DIR to the nearest ancestor with a local .codemie config', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '/workspace/mono/apps/web';
+      hasLocalConfigMock.mockImplementation(async (dir: string) => dir === '/workspace/mono');
+      await run();
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/workspace/mono');
+    });
+
+    it('falls back to CLAUDE_PROJECT_DIR itself when no ancestor has a local .codemie config', async () => {
+      process.env['CLAUDE_PROJECT_DIR'] = '/workspace/project';
+      hasLocalConfigMock.mockResolvedValue(false);
+      await run();
+      expect(getActiveProfileNameMock).toHaveBeenCalledWith('/workspace/project');
+    });
+
+    it('returns the pinned project for a session without re-resolving from cwd', async () => {
+      readPinnedProjectNameMock.mockResolvedValue('pinned-project');
+      await run({ sessionId: 's1' });
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'pinned-project' });
+      expect(getActiveProfileNameMock).not.toHaveBeenCalled();
+    });
+
+    it("pins a session's first resolved project for its later hooks to read back unchanged", async () => {
+      await run({ sessionId: 's1' });
+      expect(pinProjectNameMock).toHaveBeenCalledWith('s1', 'proj-1');
+    });
+
+    it('CODEMIE_PROJECT wins over a pinned project, and is never itself pinned', async () => {
+      process.env['CODEMIE_PROJECT'] = 'env-project';
+      await run({ sessionId: 's1' });
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'env-project' });
+      expect(readPinnedProjectNameMock).not.toHaveBeenCalled();
+      expect(pinProjectNameMock).not.toHaveBeenCalled();
+    });
+
+    it('does not consult or write the pin for a hook with no sessionId', async () => {
+      await run();
+      expect(readPinnedProjectNameMock).not.toHaveBeenCalled();
+      expect(pinProjectNameMock).not.toHaveBeenCalled();
+    });
+
+    it("uses this hook's own resolved value when it loses the pin race", async () => {
+      pinProjectNameMock.mockResolvedValue('winner-project');
+      await run({ sessionId: 's1' });
+      expect(forwarded()[0]).toMatchObject({ codemie_project_name: 'winner-project' });
+    });
+
+    it('still forwards with empty identity fields when identity resolution fails, independent of project and version', async () => {
       resolveHookCredentialsMock.mockRejectedValue(new Error('boom'));
       await run();
       expect(forwarded()).toHaveLength(1);
@@ -230,8 +318,8 @@ describe('OtlpAgentAdapter.processOtlpEvent', () => {
         user_email: '',
         developer_name: '',
         identity_source: '',
-        codemie_project_name: '',
-        codemie_cli_version: '',
+        codemie_project_name: 'proj-1',
+        codemie_cli_version: '1.2.3',
         git_branch: 'main',
       });
     });
