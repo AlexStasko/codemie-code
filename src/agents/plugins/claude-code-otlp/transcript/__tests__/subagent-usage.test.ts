@@ -21,12 +21,15 @@ import { join } from 'node:path';
 import {
   findSubagentFiles,
   readSubagentMeta,
+  readForkedSkillMarker,
+  subagentFilePath,
   buildUsageTotals,
   buildSubagentUsageEvent,
   type SubagentFile,
 } from '../subagent-usage.js';
 import { parseUsageLine, buildUsageRequestEvent } from '../usage-request.js';
 import type { OpenUsageRequest } from '../parse-state.js';
+import { isPathWithinDirectory } from '@/utils/paths.js';
 
 let tmpDir: string | undefined;
 
@@ -184,6 +187,74 @@ describe('readSubagentMeta', () => {
   it('resolves to {} when the sidecar is missing, without throwing', async () => {
     const meta = await readSubagentMeta('C:/nonexistent/agent-ghost.jsonl');
     expect(meta).toEqual({});
+  });
+
+  it("does not treat a regular named agent's .meta.json `name` as a skill signal (EPMCDME-15968 regression: `name` is the Agent tool's addressing field, set for any named agent, forked skill or not)", async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'codemie-subagent-meta-'));
+    const jsonlPath = join(tmpDir, 'agent-x2.jsonl');
+    await writeFile(jsonlPath, '');
+    await writeFile(
+      join(tmpDir, 'agent-x2.meta.json'),
+      JSON.stringify({ agentType: 'fork', name: 'repo-scout', spawnDepth: 1, description: 'Deep repo analysis' })
+    );
+
+    const meta = await readSubagentMeta(jsonlPath);
+
+    expect(meta).not.toHaveProperty('name');
+  });
+});
+
+describe('readForkedSkillMarker', () => {
+  it('reads skillName from a real forked-skill marker sidecar ({"forkedSkill":true,"skillName":"<name>"})', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'codemie-subagent-meta-'));
+    const jsonlPath = join(tmpDir, 'agent-x3.jsonl');
+    await writeFile(jsonlPath, '');
+    await writeFile(
+      join(tmpDir, 'agent-x3.forked-skill.marker.json'),
+      JSON.stringify({ forkedSkill: true, skillName: 'code-review' })
+    );
+
+    const marker = await readForkedSkillMarker(jsonlPath);
+
+    expect(marker).toEqual({ skillName: 'code-review' });
+  });
+
+  it('resolves to {} when the marker sidecar is missing — the common case, a regular agent dispatch', async () => {
+    const marker = await readForkedSkillMarker('C:/nonexistent/agent-ghost.jsonl');
+    expect(marker).toEqual({});
+  });
+
+  it('resolves to {} when forkedSkill is not true, even if skillName is present', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'codemie-subagent-meta-'));
+    const jsonlPath = join(tmpDir, 'agent-x4.jsonl');
+    await writeFile(jsonlPath, '');
+    await writeFile(
+      join(tmpDir, 'agent-x4.forked-skill.marker.json'),
+      JSON.stringify({ forkedSkill: false, skillName: 'code-review' })
+    );
+
+    const marker = await readForkedSkillMarker(jsonlPath);
+
+    expect(marker).toEqual({});
+  });
+});
+
+describe('subagentFilePath', () => {
+  it('builds <parentDir>/<sessionId>/subagents/agent-<agentId>.jsonl from a main transcript path and agentId', () => {
+    const mainTranscriptPath = join('proj-dir', 'session-1.jsonl');
+
+    const path = subagentFilePath(mainTranscriptPath, 'a123');
+
+    expect(path).toBe(join('proj-dir', 'session-1', 'subagents', 'agent-a123.jsonl'));
+  });
+
+  it('never resolves outside the subagents directory for a crafted agentId (CR-002 regression)', () => {
+    const mainTranscriptPath = join('proj-dir', 'session-1.jsonl');
+    const subagentsDir = join('proj-dir', 'session-1', 'subagents');
+
+    const path = subagentFilePath(mainTranscriptPath, '../../../etc/passwd');
+
+    expect(isPathWithinDirectory(subagentsDir, path)).toBe(true);
   });
 });
 

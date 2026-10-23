@@ -385,10 +385,11 @@ async function deriveMainEvents(
       startedAt,
       endedAt
     );
-    // Main-thread requests — 'main' and 'skill' are both made on the main thread; the
-    // contract's api_calls excludes only subagent ('agent') requests.
+    // Main-thread requests — 'main' and 'skill' are both made on the main thread, scoped with an
+    // empty agentId; the contract's api_calls excludes subagent requests, including a forked
+    // skill's (scopeKind: 'skill' too, but with its own agentId — see deriveSubagentEvents).
     summaryEvent.api_calls = Object.values(state.openRequests).filter(
-      (r) => r.scopeKind === 'main' || r.scopeKind === 'skill'
+      (r) => (r.scopeKind === 'main' || r.scopeKind === 'skill') && !r.agentId
     ).length;
     events.push(summaryEvent);
   }
@@ -604,10 +605,15 @@ async function deriveSubagentEvents(
 
   const touchedKeys = new Set<string>();
   const agentType = subagentFile.agentType ?? '';
+  // A forked skill (EPMCDME-15968: a slash-command skill run as a background subagent) scopes
+  // its usage as `scope_kind: 'skill'` / `scope_name: <skillName>`, same as the main transcript's
+  // `deriveMainEvents` does for an inline skill (`state.activeSkill`) — a regular subagent keeps
+  // `scope_kind: 'agent'` / `scope_name: <agentType>`. `agentId` is kept either way, so the
+  // backend's per-agent cost join is unaffected.
+  const scopeKind = subagentFile.skillName ? 'skill' : 'agent';
+  const scopeName = subagentFile.skillName || agentType;
   for (const line of lines) {
-    // Contract: for `scope_kind: 'agent'`, `scope_name` carries the agent type (never `''` unless
-    // the type itself is unresolved) — same source as the `agent_type` field below.
-    const parsed = parseUsageLine(line, 'agent', agentType, subagentFile.agentId, agentType);
+    const parsed = parseUsageLine(line, scopeKind, scopeName, subagentFile.agentId, agentType);
     if (parsed) {
       const key = usageRequestKey(parsed);
       const existing = state.openRequests[key];
@@ -622,11 +628,12 @@ async function deriveSubagentEvents(
     events.push(buildUsageRequestEvent(sessionId, state.openRequests[key]));
   }
 
-  // Cumulative usage for this agent — every scope_kind:'agent' record known for it so far,
-  // not just the ones touched this pass (consistent with buildFullAccumulator's own
-  // "recomputed from full state" framing for the sibling agent.session.summary event).
+  // Cumulative usage for this agent — every record of its own scope_kind ('skill' for a forked
+  // skill, 'agent' otherwise) known for it so far, not just the ones touched this pass
+  // (consistent with buildFullAccumulator's own "recomputed from full state" framing for the
+  // sibling agent.session.summary event).
   const usageRequestsForAgent = Object.values(state.openRequests).filter(
-    (r) => r.scopeKind === 'agent' && r.agentId === subagentFile.agentId
+    (r) => r.scopeKind === scopeKind && r.agentId === subagentFile.agentId
   );
 
   const scan = await scanSubagentTranscript(subagentFile.filePath);
@@ -675,8 +682,9 @@ export async function openSubagentPass(sessionId: string, subagentFile: Subagent
  * all against **one** in-memory `state` under **one** lock acquisition (so there is exactly one
  * save at the end, instead of one per collector as a loop of separate passes would do).
  *
- * The main transcript is derived first, so `api_calls` (computed from `scopeKind: 'main' | 'skill'`
- * records) can never be inflated by a subagent's records. A subagent whose offset already
+ * `api_calls` (computed from `scopeKind: 'main' | 'skill'` records with an empty `agentId`) is
+ * never inflated by a subagent's records, including a forked skill's own `scopeKind: 'skill'`
+ * ones — see the `agentId` guard in {@link deriveMainEvents}. A subagent whose offset already
  * covers its file ({@link subagentAlreadyCovered}) is skipped — its own `SubagentStop` (or an
  * earlier backstop run) already reported it. Sharing one `state` across subagents loses the
  * per-collector isolation separate passes would give it, so each subagent derivation first

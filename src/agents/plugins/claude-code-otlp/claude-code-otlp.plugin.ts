@@ -6,6 +6,7 @@ import type {
   SessionEndHookInput,
   StopFailureHookInput,
   StopHookInput,
+  SubagentStartHookInput,
   SubagentStopHookInput,
   UserPromptSubmitHookInput,
   UserPromptSubmitHookSpecificOutput,
@@ -23,7 +24,7 @@ import {
   openSessionEndPass,
   type SubagentFile,
 } from './transcript/orchestrator.js';
-import { readSubagentMeta } from './transcript/subagent-usage.js';
+import { readForkedSkillMarker, readSubagentMeta, subagentFilePath } from './transcript/subagent-usage.js';
 import { resolveClientVersion } from './client-version-cache.js';
 
 const HOOK_EVENT_TYPE_MAP: Record<string, string> = {
@@ -93,8 +94,25 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
     if (hookInput.hook_event_name === 'SubagentStop') {
       return await this.onSubagentStopEvent(hookInput);
     }
+    if (hookInput.hook_event_name === 'SubagentStart') {
+      return await this.onSubagentStartEvent(hookInput);
+    }
 
     return { decision: 'forward', payload: [hookInput] };
+  }
+
+  private async onSubagentStartEvent(hookInput: SubagentStartHookInput): Promise<ClaudeForwardDecision> {
+    if (!hookInput.agent_type) {
+      // Same internal check-in filter as onSubagentStopEvent — not a real subagent dispatch.
+      return { decision: 'forward', payload: [] };
+    }
+
+    // SubagentStart carries no agent_transcript_path (unlike SubagentStop) — build the path from
+    // the triggering hook's own transcript_path (the main transcript) and agent_id instead.
+    const agentTranscriptPath = subagentFilePath(hookInput.transcript_path, hookInput.agent_id);
+    const marker = await readForkedSkillMarker(agentTranscriptPath);
+    const payload = marker.skillName ? { ...hookInput, skill_name: marker.skillName } : hookInput;
+    return { decision: 'forward', payload: [payload] };
   }
 
   private async onStopEvent(hookInput: StopHookInput): Promise<ClaudeForwardDecision> {
@@ -130,9 +148,17 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
       return { decision: 'forward', payload: [hookInput] };
     }
 
-    const meta = await readSubagentMeta(agentTranscriptPath);
+    const [meta, marker] = await Promise.all([
+      readSubagentMeta(agentTranscriptPath),
+      readForkedSkillMarker(agentTranscriptPath),
+    ]);
+    // Never let agentId resolve to '' (CR-001): deriveMainEvents' api_calls filter treats an
+    // empty agentId as main-thread, so a forked skill's subagent ending up with one here would
+    // double-count its usage right back into api_calls. agentTranscriptPath is already confirmed
+    // non-empty above, so it is always a safe final fallback.
+    const derivedAgentId = basename(agentTranscriptPath).replace(/^agent-/, '').replace(/\.jsonl$/, '');
     const subagentFile: SubagentFile = {
-      agentId: hookInput.agent_id || basename(agentTranscriptPath).replace(/^agent-/, '').replace(/\.jsonl$/, ''),
+      agentId: hookInput.agent_id || derivedAgentId || agentTranscriptPath,
       filePath: agentTranscriptPath,
       // `tool_use_id` is not declared on the SDK's SubagentStopHookInput type; the hook payload
       // wins when it carries it anyway, else fall back to the `.meta.json` sidecar.
@@ -141,10 +167,12 @@ export class ClaudeCodeOtlpPlugin extends OtlpAgentAdapter<HookInput, UserPrompt
       spawnDepth: meta.spawnDepth,
       description: meta.description,
       cwd: hookInput.cwd,
+      skillName: marker.skillName,
     };
 
     const pass = await openSubagentPass(hookInput.session_id, subagentFile);
-    return { decision: 'forward', payload: [hookInput, ...pass.events], finalize: pass.finalize };
+    const stopPayload = marker.skillName ? { ...hookInput, skill_name: marker.skillName } : hookInput;
+    return { decision: 'forward', payload: [stopPayload, ...pass.events], finalize: pass.finalize };
   }
 
   private async ensureProxyAuth(): Promise<AuthGateResult> {

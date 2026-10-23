@@ -481,6 +481,30 @@ describe('openMainTranscriptPass — api_calls', () => {
     // 2 main-thread requests (1 main + 1 skill); the subagent's request must not inflate this.
     expect(summary?.api_calls).toBe(2);
   });
+
+  it('excludes a forked skill subagent\'s already-persisted requests from a later Stop summary (EPMCDME-15968 regression)', async () => {
+    const sessionId = 'session-api-calls-forked-skill';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'uuid-a1-1', messageId: 'msg-a1-1', outputTokens: 30 }),
+      usageLine({ uuid: 'uuid-a1-2', messageId: 'msg-a1-2', outputTokens: 40 }),
+      usageLine({ uuid: 'uuid-a1-3', messageId: 'msg-a1-3', outputTokens: 50 }),
+    ]);
+    // A forked skill's subagent — its usage is persisted as scope_kind='skill' (same as a
+    // main-thread inline skill) via its own SubagentStop, *before* the main Stop below runs.
+    const subagentPass = await subagentEvents(sessionId, { ...file, skillName: 'code-review' });
+    expect(subagentPass.filter((e) => e.type === 'agent.usage.request')).toHaveLength(3);
+
+    const mainTranscriptPath = writeTranscript(`${sessionId}.jsonl`, [
+      usageLine({ uuid: 'u1', messageId: 'msg-1', outputTokens: 10 }),
+      usageLine({ uuid: 'u2', messageId: 'msg-2', outputTokens: 20 }),
+    ]);
+    const events = await mainEvents(sessionId, mainTranscriptPath, 'Stop');
+    const summary = events.find((e) => e.type === 'agent.session.summary');
+
+    // 2 main-thread requests only; the forked skill's 3 already-persisted subagent requests
+    // (scope_kind='skill', but with their own agentId) must not inflate this.
+    expect(summary?.api_calls).toBe(2);
+  });
 });
 
 describe('openMainTranscriptPass — skill scoping', () => {
@@ -791,6 +815,37 @@ describe('openSubagentPass — request identity', () => {
     const usage = events.filter((e) => e.type === 'agent.usage.request');
 
     expect(usage[0]).toMatchObject({ agent_type: '', scope_kind: 'agent', scope_name: '' });
+  });
+
+  it('scopes a forked skill (SubagentFile.skillName set) as scope_kind=skill/scope_name=<skillName>, never scope_kind=agent (EPMCDME-15968)', async () => {
+
+    const sessionId = 'session-sub-forked-skill';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10 }),
+    ]);
+
+    const events = await subagentEvents(sessionId, { ...file, agentType: 'general-purpose', skillName: 'code-review' });
+    const usage = events.filter((e) => e.type === 'agent.usage.request');
+    const subagentUsage = events.find((e) => e.type === 'agent.subagent.usage');
+
+    // agent_type is kept as-is (still informative) — only scope_kind/scope_name change.
+    expect(usage[0]).toMatchObject({ agent_type: 'general-purpose', scope_kind: 'skill', scope_name: 'code-review' });
+    expect(subagentUsage?.usage).toEqual([
+      expect.objectContaining({ scope_kind: 'skill', scope_name: 'code-review' }),
+    ]);
+  });
+
+  it('falls back to agentType for scope_name when SubagentFile.skillName is an empty string, keeping scope_kind=agent consistent with scope_name (EPMCDME-15968 regression)', async () => {
+
+    const sessionId = 'session-sub-empty-skill-name';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10 }),
+    ]);
+
+    const events = await subagentEvents(sessionId, { ...file, agentType: 'general-purpose', skillName: '' });
+    const usage = events.filter((e) => e.type === 'agent.usage.request');
+
+    expect(usage[0]).toMatchObject({ scope_kind: 'agent', scope_name: 'general-purpose' });
   });
 
   it('carries agentType onto agent.subagent.usage\'s usage[] rows as scope_name, matching the contract\'s (model, speed, inference_geo, service_tier, scope_kind, scope_name) grouping key (EPMCDME-15783)', async () => {
