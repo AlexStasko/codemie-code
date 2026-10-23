@@ -187,6 +187,16 @@ export function mergeUsageRequest(a: OpenUsageRequest, b: OpenUsageRequest): Ope
 }
 
 /**
+ * True when the request's `output_tokens` cannot be trusted as final: Claude Code can write an
+ * assistant row mid-stream (`stop_reason` null) and never rewrite it, leaving a placeholder count.
+ * A request whose merged record still has no `stop_reason` never saw its finalizing row.
+ * API-error rows legitimately carry no `stop_reason` and are not partial.
+ */
+export function isOutputTokensPartial(req: Pick<OpenUsageRequest, 'stopReason' | 'isApiError'>): boolean {
+  return !req.stopReason && !req.isApiError;
+}
+
+/**
  * Build the `agent.usage.request` event payload for `req`. Carries its own explicit `type`, so
  * the adapter base class stamps `event_id`/`schema_version` onto it at hook time —
  * this function deliberately does not set either.
@@ -207,6 +217,7 @@ export function buildUsageRequestEvent(sessionId: string, req: OpenUsageRequest)
     cache_creation_1h_tokens: req.cacheCreation1hTokens,
     cache_read_tokens: req.cacheReadTokens,
     output_tokens: req.outputTokens,
+    output_tokens_partial: isOutputTokensPartial(req),
     thinking_tokens: req.thinkingTokens,
     web_search_requests: req.webSearchRequests,
     web_fetch_requests: req.webFetchRequests,
